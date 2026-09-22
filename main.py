@@ -86,7 +86,12 @@ def init_db():
     conn.commit()
     conn.close()
 
-init_db()
+@app.on_event("startup")
+def startup_event():
+    init_db()
+    print("\n==================================================")
+    print("🚀 PRENDIÓ LA VERSIÓN 3.0.0 - Q-LEARNING ZOMBIE AI ACTIVE")
+    print("==================================================\n")
 
 # Models
 class BattleActionResult(BaseModel):
@@ -98,11 +103,16 @@ class BattleActionResult(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "online", "service": "Roblox Q-Learning Zombie AI", "db": "SQLite persistent"}
+    return {
+        "status": "online",
+        "message": "PRENDIÓ LA VERSIÓN 3.0.0 - Q-LEARNING ZOMBIE AI ACTIVE",
+        "version": "3.0.0",
+        "db": "SQLite persistent"
+    }
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": "3.0.0"}
 
 @app.get("/api/v1/zombie-brain-weights")
 def get_zombie_brain_weights():
@@ -121,7 +131,12 @@ def get_zombie_brain_weights():
             "q_values": json.loads(q_values_json),
             "total_battles": battles
         }
-    return {"version": int(time.time()), "zombies": result}
+    return {
+        "version": "3.0.0",
+        "timestamp": int(time.time()),
+        "message": "PRENDIÓ LA VERSIÓN 3.0.0",
+        "zombies": result
+    }
 
 @app.post("/api/v1/report-zombie-action")
 def report_zombie_action(action: BattleActionResult):
@@ -168,7 +183,7 @@ def report_zombie_action(action: BattleActionResult):
     conn.commit()
     conn.close()
     
-    return {"status": "success", "updated_q": new_q}
+    return {"status": "success", "updated_q": new_q, "server_version": "3.0.0"}
 
 @app.get("/api/v1/backup-db")
 def backup_db():
