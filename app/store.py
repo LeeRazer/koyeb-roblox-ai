@@ -19,6 +19,7 @@ from sqlalchemy import (
     Table,
     Text,
     create_engine,
+    delete,
     event,
     func,
     inspect,
@@ -67,7 +68,23 @@ battle_events = Table(
     Column("job_id", String(128), nullable=False),
     Column("client_version", String(32), nullable=False),
     Column("context", JSON, nullable=False),
-    Column("received_at", Float, nullable=False),
+    Column("received_at", Float, nullable=False, index=True),
+)
+
+
+daily_action_stats = Table(
+    "ai_daily_action_stats",
+    metadata,
+    Column("day_utc", String(10), primary_key=True),
+    Column("enemy_type", String(64), primary_key=True),
+    Column("action_name", String(64), primary_key=True),
+    Column("difficulty", String(16), primary_key=True),
+    Column("event_count", Integer, nullable=False, default=0),
+    Column("success_count", Integer, nullable=False, default=0),
+    Column("dashed_count", Integer, nullable=False, default=0),
+    Column("reward_sum", Float, nullable=False, default=0),
+    Column("damage_sum", Float, nullable=False, default=0),
+    Column("updated_at", Float, nullable=False),
 )
 
 
@@ -111,6 +128,7 @@ def _clamp(value: float, minimum: float, maximum: float) -> float:
 class AIStore:
     def __init__(self, settings: Settings):
         self.settings = settings
+        self._last_prune_monotonic = 0.0
         engine_options: dict[str, Any] = {"pool_pre_ping": True, "future": True}
         if settings.database_url.startswith("sqlite:"):
             engine_options["connect_args"] = {"check_same_thread": False, "timeout": 30}
@@ -177,7 +195,7 @@ class AIStore:
 
             self._migrate_legacy_if_present(connection)
 
-            state_created = self._insert_ignore(
+            self._insert_ignore(
                 connection,
                 runtime_state,
                 {
@@ -189,20 +207,38 @@ class AIStore:
                 },
             )
 
-            if state_created:
-                initial_version = f"{self.settings.service_version}-r0"
+            # Do not rely on INSERT .. ON CONFLICT rowcount to decide whether
+            # the active model exists. Some PostgreSQL drivers can report an
+            # ambiguous rowcount, leaving runtime_state pointing at a missing
+            # snapshot after an otherwise successful first startup.
+            state = connection.execute(
+                select(runtime_state).where(runtime_state.c.id == 1)
+            ).mappings().one()
+            active_version = str(state["active_version"])
+            version_exists = connection.execute(
+                select(model_versions.c.version).where(
+                    model_versions.c.version == active_version
+                )
+            ).scalar_one_or_none()
+            if version_exists is None:
+                LOGGER.warning(
+                    "Active model %s was missing; rebuilding its snapshot from candidate state",
+                    active_version,
+                )
                 self._insert_ignore(
                     connection,
                     model_versions,
                     {
-                        "version": initial_version,
+                        "version": active_version,
                         "status": "production",
                         "snapshot": {"zombies": self._candidate_snapshot(connection)},
-                        "note": "initial validated defaults",
+                        "note": "recovered missing active snapshot",
                         "created_at": now,
                         "promoted_at": now,
                     },
                 )
+
+            self._prune_raw_events(connection, now)
 
     def _insert_ignore(
         self,
@@ -311,6 +347,75 @@ class AIStore:
         result = connection.execute(statement)
         return result.rowcount == 1
 
+    def _record_daily_aggregate(
+        self,
+        connection: Connection,
+        *,
+        enemy_type: str,
+        action_name: str,
+        difficulty: str,
+        reward: float,
+        damage: float,
+        player_dashed: bool,
+        received_at: float,
+    ) -> None:
+        key_columns = [
+            daily_action_stats.c.day_utc,
+            daily_action_stats.c.enemy_type,
+            daily_action_stats.c.action_name,
+            daily_action_stats.c.difficulty,
+        ]
+        values = {
+            "day_utc": time.strftime("%Y-%m-%d", time.gmtime(received_at)),
+            "enemy_type": enemy_type,
+            "action_name": action_name,
+            "difficulty": difficulty,
+            "event_count": 1,
+            "success_count": 1 if reward > 0 else 0,
+            "dashed_count": 1 if player_dashed else 0,
+            "reward_sum": reward,
+            "damage_sum": damage,
+            "updated_at": received_at,
+        }
+        if self.is_postgresql:
+            statement = postgresql_insert(daily_action_stats).values(**values)
+        else:
+            statement = sqlite_insert(daily_action_stats).values(**values)
+        statement = statement.on_conflict_do_update(
+            index_elements=key_columns,
+            set_={
+                "event_count": daily_action_stats.c.event_count + 1,
+                "success_count": daily_action_stats.c.success_count + values["success_count"],
+                "dashed_count": daily_action_stats.c.dashed_count + values["dashed_count"],
+                "reward_sum": daily_action_stats.c.reward_sum + reward,
+                "damage_sum": daily_action_stats.c.damage_sum + damage,
+                "updated_at": received_at,
+            },
+        )
+        connection.execute(statement)
+
+    def _prune_raw_events(self, connection: Connection, now: float) -> int:
+        cutoff = now - self.settings.raw_event_retention_hours * 3_600
+        result = connection.execute(
+            delete(battle_events).where(battle_events.c.received_at < cutoff)
+        )
+        deleted_count = max(0, int(result.rowcount or 0))
+        self._last_prune_monotonic = time.monotonic()
+        if deleted_count:
+            connection.execute(
+                insert(admin_audit).values(
+                    action="retention_prune",
+                    details={"deleted_events": deleted_count, "cutoff": cutoff},
+                    created_at=now,
+                )
+            )
+        return deleted_count
+
+    def prune_raw_events(self, now: float | None = None) -> int:
+        """Delete expired raw rows without touching aggregates or learned policy."""
+        with self.transaction() as connection:
+            return self._prune_raw_events(connection, now or time.time())
+
     def process_batch(self, batch: dict[str, Any]) -> dict[str, int]:
         accepted = 0
         duplicates = 0
@@ -329,6 +434,9 @@ class AIStore:
 
                 reward = float(event_data["reward"])
                 normalized_reward = _clamp(reward / 4.0, -1.0, 1.0)
+                received_at = time.time()
+                damage = float(event_data.get("player_health_lost", 0))
+                player_dashed = bool(event_data.get("player_dashed", False))
                 inserted = self._insert_event_if_new(
                     connection,
                     {
@@ -338,23 +446,37 @@ class AIStore:
                         "raw_action_name": raw_action,
                         "reward": reward,
                         "normalized_reward": normalized_reward,
-                        "player_dashed": bool(event_data.get("player_dashed", False)),
-                        "player_health_lost": float(event_data.get("player_health_lost", 0)),
+                        "player_dashed": player_dashed,
+                        "player_health_lost": damage,
                         "universe_id": batch["universe_id"],
                         "place_id": batch["place_id"],
                         "job_id": batch["job_id"],
                         "client_version": batch["client_version"],
                         "context": {
+                            "encounter_id": event_data.get("encounter_id"),
+                            "sequence_number": event_data.get("sequence_number"),
                             "occurred_at": event_data.get("occurred_at"),
                             "difficulty": event_data.get("difficulty"),
                             "room_number": event_data.get("room_number"),
+                            "decision_context": event_data.get("decision_context"),
                         },
-                        "received_at": time.time(),
+                        "received_at": received_at,
                     },
                 )
                 if not inserted:
                     duplicates += 1
                     continue
+
+                self._record_daily_aggregate(
+                    connection,
+                    enemy_type=enemy_type,
+                    action_name=action_name,
+                    difficulty=event_data.get("difficulty") or "Unknown",
+                    reward=normalized_reward,
+                    damage=damage,
+                    player_dashed=player_dashed,
+                    received_at=received_at,
+                )
 
                 weight_statement = select(candidate_weights).where(
                     candidate_weights.c.enemy_type == enemy_type
@@ -387,7 +509,51 @@ class AIStore:
                 )
 
             revision = int(state["candidate_revision"]) + accepted
+            if (
+                time.monotonic() - self._last_prune_monotonic
+                >= self.settings.prune_interval_seconds
+            ):
+                self._prune_raw_events(connection, time.time())
         return {"accepted": accepted, "duplicates": duplicates, "candidate_revision": revision}
+
+    def get_storage_status(self) -> dict[str, Any]:
+        with self.engine.connect() as connection:
+            raw_event_count = int(
+                connection.execute(select(func.count()).select_from(battle_events)).scalar_one()
+            )
+            oldest_raw_event = connection.execute(
+                select(func.min(battle_events.c.received_at))
+            ).scalar_one()
+            aggregate_rows = int(
+                connection.execute(select(func.count()).select_from(daily_action_stats)).scalar_one()
+            )
+            aggregated_events = int(
+                connection.execute(
+                    select(func.coalesce(func.sum(daily_action_stats.c.event_count), 0))
+                ).scalar_one()
+            )
+            version_count = int(
+                connection.execute(select(func.count()).select_from(model_versions)).scalar_one()
+            )
+            if self.is_postgresql:
+                database_bytes = int(
+                    connection.execute(text("SELECT pg_database_size(current_database())")).scalar_one()
+                )
+            else:
+                page_count = int(connection.exec_driver_sql("PRAGMA page_count").scalar_one())
+                page_size = int(connection.exec_driver_sql("PRAGMA page_size").scalar_one())
+                database_bytes = page_count * page_size
+
+        return {
+            "database": self.engine.dialect.name,
+            "database_bytes": database_bytes,
+            "raw_event_count": raw_event_count,
+            "oldest_raw_event": oldest_raw_event,
+            "raw_event_retention_hours": self.settings.raw_event_retention_hours,
+            "daily_aggregate_rows": aggregate_rows,
+            "aggregated_event_count": aggregated_events,
+            "model_version_count": version_count,
+        }
 
     def get_candidate(self) -> dict[str, Any]:
         with self.engine.connect() as connection:
@@ -514,5 +680,6 @@ class AIStore:
             "candidate": self.get_candidate(),
             "versions": versions,
             "event_count": int(event_count),
+            "storage": self.get_storage_status(),
         }
 

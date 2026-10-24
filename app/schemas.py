@@ -38,11 +38,30 @@ class BattleActionResultV1(StrictModel):
         return self
 
 
+class DecisionContext(StrictModel):
+    distance_to_target: float | None = Field(default=None, ge=0, le=10_000)
+    has_line_of_sight: bool | None = None
+    self_health_ratio: float | None = Field(default=None, ge=0, le=1)
+    target_health_ratio: float | None = Field(default=None, ge=0, le=1)
+    target_stamina_ratio: float | None = Field(default=None, ge=0, le=1)
+    ability_ready: bool | None = None
+    nearby_allies: int | None = Field(default=None, ge=0, le=100)
+    nearby_specials: int | None = Field(default=None, ge=0, le=20)
+    target_isolated: bool | None = None
+    team_stress: float | None = Field(default=None, ge=0, le=1)
+    room_phase: Literal["setup", "exploration", "combat", "holdout", "escape"] | None = None
+    previous_action: ActionName | None = None
+    outcome_latency_ms: int | None = Field(default=None, ge=0, le=120_000)
+
+
 class CombatEvent(BattleActionResultV1):
     event_id: UUID
+    encounter_id: UUID | None = None
+    sequence_number: int | None = Field(default=None, ge=0, le=1_000_000)
     occurred_at: int | None = Field(default=None, ge=0, le=4_102_444_800)
     difficulty: Literal["Easy", "Normal", "Hard", "Nightmare", "Endless"] | None = None
     room_number: int | None = Field(default=None, ge=0, le=10_000)
+    decision_context: DecisionContext | None = None
 
 
 class CombatEventBatch(StrictModel):
@@ -66,6 +85,11 @@ class PromoteRequest(StrictModel):
     force: bool = False
 
 
+class PlatformPromoteRequest(PromoteRequest):
+    minimum_samples_per_action: int = Field(default=20, ge=1, le=1_000_000_000)
+    minimum_eligible_actions: int = Field(default=1, ge=1, le=10_000)
+
+
 class RollbackRequest(StrictModel):
     version: str = Field(min_length=1, max_length=64)
     note: str = Field(default="manual rollback", min_length=1, max_length=250)
@@ -77,4 +101,29 @@ class SnapshotResponse(StrictModel):
     timestamp: int
     director_modifiers: dict[str, float | int]
     zombies: dict[str, dict[str, Any]]
+
+
+class ProjectCreate(StrictModel):
+    name: str = Field(min_length=2, max_length=100)
+    slug: str | None = Field(
+        default=None,
+        min_length=2,
+        max_length=50,
+        pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$",
+    )
+    universe_id: str = Field(min_length=1, max_length=32, pattern=r"^[0-9]+$")
+    place_ids: list[str] = Field(default_factory=list, max_length=50)
+
+    @field_validator("place_ids")
+    @classmethod
+    def valid_place_ids(cls, values: list[str]) -> list[str]:
+        if len(values) != len(set(values)):
+            raise ValueError("place_ids contiene duplicados")
+        if any(not value.isdigit() or len(value) > 32 for value in values):
+            raise ValueError("place_ids debe contener identificadores numericos")
+        return values
+
+
+class ProjectKeyCreate(StrictModel):
+    label: str = Field(default="primary", min_length=1, max_length=80)
 

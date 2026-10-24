@@ -13,11 +13,15 @@ from app.schemas import (
     CombatEventBatch,
     DirectorModifiers,
     PromoteRequest,
+    PlatformPromoteRequest,
+    ProjectCreate,
+    ProjectKeyCreate,
     RollbackRequest,
     SnapshotResponse,
 )
-from app.security import WriteGuard
+from app.security import AdminGuard, IdentityRateLimiter, WriteGuard
 from app.store import AIStore
+from app.platform_store import PlatformStore
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -27,11 +31,15 @@ LOGGER = logging.getLogger("roblox-ai")
 def create_app(settings: Settings | None = None) -> FastAPI:
     configured = settings or load_settings()
     store = AIStore(configured)
+    platform = PlatformStore(store, configured)
     guard = WriteGuard(configured)
+    admin_guard = AdminGuard(configured)
+    platform_limiter = IdentityRateLimiter(configured.write_rate_limit_per_minute)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         store.initialize()
+        platform.initialize()
         LOGGER.info(
             "Roblox AI service %s ready (database=%s, writes=%s)",
             configured.service_version,
@@ -42,6 +50,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             LOGGER.warning(
                 "SQLite activo: en Koyeb los datos se pierden al recrear la instancia "
                 "salvo que SQLITE_PATH apunte a un volumen persistente"
+            )
+        if configured.api_key and not configured.admin_api_key:
+            LOGGER.warning(
+                "ADMIN_API_KEY no configurada: las rutas admin usan temporalmente AI_API_KEY"
             )
         try:
             yield
@@ -55,6 +67,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = configured
     app.state.store = store
+    app.state.platform_store = platform
+
+    def platform_access(request: Request) -> dict[str, Any]:
+        auth = platform.authenticate(request.headers.get("X-API-Key", ""))
+        if auth is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Project API key invalida o revocada",
+            )
+        platform_limiter.check(auth["key_id"])
+        return auth
 
     @app.get("/")
     def root() -> dict[str, Any]:
@@ -172,6 +195,159 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/v2/admin/export")
     def export_state(_access: None = Depends(guard)) -> dict[str, Any]:
         return store.export_state()
+
+    @app.get("/api/v2/admin/storage")
+    def storage_status(_access: None = Depends(guard)) -> dict[str, Any]:
+        return store.get_storage_status()
+
+    # v3 is an additive, opt-in public-platform contract. Existing Roblox
+    # servers remain on v1/v2 until the new SDK passes staging and canary gates.
+    @app.post("/api/v3/admin/projects")
+    def create_platform_project(
+        payload: ProjectCreate,
+        _access: None = Depends(admin_guard),
+    ) -> dict[str, Any]:
+        try:
+            return platform.create_project(payload.model_dump())
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    @app.get("/api/v3/admin/projects")
+    def list_platform_projects(
+        _access: None = Depends(admin_guard),
+    ) -> list[dict[str, Any]]:
+        return platform.list_projects()
+
+    @app.post("/api/v3/admin/projects/{project_id}/keys")
+    def create_platform_key(
+        project_id: str,
+        payload: ProjectKeyCreate,
+        _access: None = Depends(admin_guard),
+    ) -> dict[str, Any]:
+        try:
+            return platform.create_key(project_id, payload.label)
+        except KeyError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Proyecto no encontrado") from exc
+
+    @app.delete("/api/v3/admin/projects/{project_id}/keys/{key_id}")
+    def revoke_platform_key(
+        project_id: str,
+        key_id: str,
+        _access: None = Depends(admin_guard),
+    ) -> dict[str, str]:
+        if not platform.revoke_key(project_id, key_id):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Clave no encontrada")
+        return {"status": "revoked"}
+
+    @app.get("/api/v3/snapshot")
+    def get_platform_snapshot(
+        request: Request,
+        auth: dict[str, Any] = Depends(platform_access),
+    ) -> dict[str, Any]:
+        universe_id = request.headers.get("X-Roblox-Universe-Id", "")
+        place_id = request.headers.get("X-Roblox-Place-Id", "")
+        if not platform.authorize_game(auth, universe_id, place_id):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Universe o Place no autorizado para este proyecto",
+            )
+        return platform.get_snapshot(auth["project"]["project_id"])
+
+    @app.post("/api/v3/events/batch")
+    def report_platform_batch(
+        batch: CombatEventBatch,
+        auth: dict[str, Any] = Depends(platform_access),
+    ) -> dict[str, Any]:
+        if len(batch.events) > configured.max_batch_size:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"El maximo configurado es {configured.max_batch_size} eventos",
+            )
+        if not platform.authorize_game(auth, batch.universe_id, batch.place_id):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Universe o Place no autorizado para este proyecto",
+            )
+        result = platform.process_batch(
+            auth["project"]["project_id"],
+            batch.model_dump(mode="json"),
+        )
+        return {"status": "accepted", **result}
+
+    @app.get("/api/v3/admin/projects/{project_id}/candidate")
+    def get_platform_candidate(
+        project_id: str,
+        _access: None = Depends(admin_guard),
+    ) -> dict[str, Any]:
+        return platform.get_candidate(project_id)
+
+    @app.post("/api/v3/admin/projects/{project_id}/promote")
+    def promote_platform_candidate(
+        project_id: str,
+        payload: PlatformPromoteRequest,
+        _access: None = Depends(admin_guard),
+    ) -> dict[str, Any]:
+        try:
+            return {
+                "status": "promoted",
+                **platform.promote(project_id, **payload.model_dump()),
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    @app.get("/api/v3/admin/projects/{project_id}/evaluation")
+    def evaluate_platform_candidate(
+        project_id: str,
+        minimum_samples_per_action: int = 20,
+        _access: None = Depends(admin_guard),
+    ) -> dict[str, Any]:
+        if minimum_samples_per_action < 1 or minimum_samples_per_action > 1_000_000:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="minimum_samples_per_action fuera de rango",
+            )
+        return platform.evaluate(project_id, minimum_samples_per_action)
+
+    @app.post("/api/v3/admin/projects/{project_id}/rollback")
+    def rollback_platform_candidate(
+        project_id: str,
+        payload: RollbackRequest,
+        _access: None = Depends(admin_guard),
+    ) -> dict[str, str]:
+        try:
+            return platform.rollback(project_id, payload.version, payload.note)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Version no encontrada",
+            ) from exc
+
+    @app.put("/api/v3/admin/projects/{project_id}/runtime-config")
+    def update_platform_runtime_config(
+        project_id: str,
+        modifiers: DirectorModifiers,
+        _access: None = Depends(admin_guard),
+    ) -> dict[str, Any]:
+        try:
+            return {
+                "status": "updated",
+                "director_modifiers": platform.update_modifiers(
+                    project_id,
+                    modifiers.model_dump(),
+                ),
+            }
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Proyecto no encontrado",
+            ) from exc
+
+    @app.get("/api/v3/admin/projects/{project_id}/storage")
+    def get_platform_storage(
+        project_id: str,
+        _access: None = Depends(admin_guard),
+    ) -> dict[str, Any]:
+        return platform.storage_status(project_id)
 
     return app
 
