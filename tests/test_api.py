@@ -5,10 +5,11 @@ import time
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from app.config import Settings
 from app.store import battle_events
+from app.platform_store import project_api_keys
 from main import create_app
 
 
@@ -235,6 +236,15 @@ def test_v3_projects_are_isolated_and_keys_can_be_revoked(tmp_path: Path) -> Non
         second_key = second_data["key"]["api_key"]
         first_project = first_data["project"]["project_id"]
         second_project = second_data["project"]["project_id"]
+
+        with client.app.state.store.engine.connect() as connection:
+            stored_key = connection.execute(
+                select(project_api_keys).where(
+                    project_api_keys.c.key_id == first_data["key"]["key_id"]
+                )
+            ).mappings().one()
+        assert stored_key["key_hash"] != first_key
+        assert first_key not in stored_key.values()
 
         first_game_headers = {
             "X-API-Key": first_key,
