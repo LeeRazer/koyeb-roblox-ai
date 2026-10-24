@@ -28,7 +28,8 @@ Sin `AI_API_KEY`, las lecturas funcionan pero todas las escrituras responden
 `503`; es un modo seguro para no aceptar aprendizaje anonimo. Sin
 `DATABASE_URL`, el servicio usa SQLite para desarrollo local. SQLite solo es
 apto en Koyeb si `SQLITE_PATH` apunta a un volumen persistente y se ejecuta una
-sola replica.
+sola replica. La imagen Docker usa `/data/zombie_ai_brain_v2.db` como respaldo
+escribible; sin un volumen montado en `/data`, ese archivo sigue siendo efimero.
 
 ## API
 
