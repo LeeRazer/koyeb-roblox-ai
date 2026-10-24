@@ -37,10 +37,35 @@ The response includes a project key exactly once. Store it securely.
 - `POST /api/v3/admin/projects/{project_id}/keys`
 - `DELETE /api/v3/admin/projects/{project_id}/keys/{key_id}`
 - `GET /api/v3/admin/projects/{project_id}/candidate`
+- `GET /api/v3/admin/projects/{project_id}/evaluation`
 - `POST /api/v3/admin/projects/{project_id}/promote`
 - `POST /api/v3/admin/projects/{project_id}/rollback`
 - `PUT /api/v3/admin/projects/{project_id}/runtime-config`
 - `GET /api/v3/admin/projects/{project_id}/storage`
+
+### Evaluate and promote a candidate
+
+`GET /api/v3/admin/projects/{project_id}/evaluation?minimum_samples_per_action=20`
+reports per-action sample counts, normalized reward mean and variance, standard
+error, lower 95% confidence bound, success rate, dash rate, and mean damage.
+This endpoint never changes the production snapshot.
+
+`POST /api/v3/admin/projects/{project_id}/promote` requires both enough total
+events and enough actions with statistically usable sample counts:
+
+```json
+{
+  "note": "validated candidate",
+  "minimum_total_events": 100,
+  "minimum_samples_per_action": 20,
+  "minimum_eligible_actions": 3,
+  "force": false
+}
+```
+
+The request returns `409 Conflict` when a gate fails and leaves production
+unchanged. `force: true` is an explicit administrative emergency override; it
+must not be used by Roblox servers or automated training jobs.
 
 ## Roblox routes
 

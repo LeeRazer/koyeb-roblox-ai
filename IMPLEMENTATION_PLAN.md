@@ -54,7 +54,7 @@ space.
 
 Exit gate: API v4 healthy in Koyeb and existing Roblox bridge still works.
 
-### Phase 1 — Data quality and bounded storage (in progress)
+### Phase 1 — Data quality and bounded storage (complete on feature branch)
 
 - Aggregate every accepted event by UTC day, enemy, action, and difficulty.
 - Retain raw events for a configurable short period.
@@ -65,7 +65,7 @@ Exit gate: API v4 healthy in Koyeb and existing Roblox bridge still works.
 Exit gate: repeated cleanup cannot change candidate weights or production
 snapshots; database growth is bounded under a sustained synthetic workload.
 
-### Phase 2 — Multi-game tenancy and key management
+### Phase 2 — Multi-game tenancy and key management (foundation complete on feature branch)
 
 - Add projects, environments, allowed Universe/Place IDs, SDK versions, quotas,
   and per-project model state.
@@ -77,7 +77,7 @@ snapshots; database growth is bounded under a sustained synthetic workload.
 Exit gate: two test projects cannot read, train, promote, or roll back each
 other's policies.
 
-### Phase 3 — Advanced telemetry schema
+### Phase 3 — Advanced telemetry schema (contract started on feature branch)
 
 - Record decision context, not raw player identity: distance bucket, line of
   sight, health/stamina bucket, cooldowns, room phase, team pressure, nearby
@@ -90,7 +90,7 @@ other's policies.
 Exit gate: telemetry is reproducible, bounded, privacy-safe, and useful for
 offline evaluation.
 
-### Phase 4 — Trainer, evaluation, and safe rollout
+### Phase 4 — Trainer, evaluation, and safe rollout (evaluator foundation started)
 
 - Replace the single moving average with confidence-aware action statistics and
   contextual policies.

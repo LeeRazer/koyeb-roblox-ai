@@ -272,6 +272,19 @@ def test_v3_projects_are_isolated_and_keys_can_be_revoked(tmp_path: Path) -> Non
         assert learned.status_code == 200
         assert learned.json()["accepted"] == 1
 
+        opposite_payload = event_batch(str(uuid4()), reward=-4.0)
+        opposite_payload["universe_id"] = "1001"
+        opposite_payload["place_id"] = "2001"
+        opposite_payload["events"][0]["player_dashed"] = True
+        opposite_payload["events"][0]["player_health_lost"] = 6
+        learned_opposite = client.post(
+            "/api/v3/events/batch",
+            json=opposite_payload,
+            headers={"X-API-Key": first_key},
+        )
+        assert learned_opposite.status_code == 200
+        assert learned_opposite.json()["accepted"] == 1
+
         first_candidate = client.get(
             f"/api/v3/admin/projects/{first_project}/candidate",
             headers=admin_headers,
@@ -280,19 +293,57 @@ def test_v3_projects_are_isolated_and_keys_can_be_revoked(tmp_path: Path) -> Non
             f"/api/v3/admin/projects/{second_project}/candidate",
             headers=admin_headers,
         ).json()
-        assert first_candidate["total_events"] == 1
+        assert first_candidate["total_events"] == 2
         assert second_candidate["total_events"] == 0
+
+        blocked_promotion = client.post(
+            f"/api/v3/admin/projects/{first_project}/promote",
+            json={
+                "note": "must not pass without evidence",
+                "minimum_total_events": 1,
+                "minimum_samples_per_action": 3,
+                "minimum_eligible_actions": 1,
+            },
+            headers=admin_headers,
+        )
+        assert blocked_promotion.status_code == 409
+        assert "Evidencia insuficiente" in blocked_promotion.json()["detail"]
+        assert client.get("/api/v3/snapshot", headers=first_game_headers).json()[
+            "version"
+        ] == "1-r0"
 
         promoted = client.post(
             f"/api/v3/admin/projects/{first_project}/promote",
-            json={"note": "isolated test", "minimum_total_events": 1},
+            json={
+                "note": "isolated test",
+                "minimum_total_events": 1,
+                "minimum_samples_per_action": 2,
+                "minimum_eligible_actions": 1,
+            },
             headers=admin_headers,
         )
         assert promoted.status_code == 200
-        assert promoted.json()["version"] == "1-r1"
+        assert promoted.json()["version"] == "1-r2"
         assert client.get("/api/v3/snapshot", headers=first_game_headers).json()[
             "version"
-        ] == "1-r1"
+        ] == "1-r2"
+
+        evaluation = client.get(
+            f"/api/v3/admin/projects/{first_project}/evaluation",
+            params={"minimum_samples_per_action": 2},
+            headers=admin_headers,
+        ).json()
+        assert evaluation["total_samples"] == 2
+        assert evaluation["eligible_actions"] == 1
+        action_evaluation = evaluation["actions"][0]
+        assert action_evaluation["sample_count"] == 2
+        assert action_evaluation["reward_mean"] == 0
+        assert action_evaluation["reward_variance"] == 2
+        assert action_evaluation["standard_error"] == 1
+        assert action_evaluation["lower_95_bound"] == -1.96
+        assert action_evaluation["success_rate"] == 0.5
+        assert action_evaluation["dash_rate"] == 0.5
+        assert action_evaluation["damage_mean"] == 8
 
         configured = client.put(
             f"/api/v3/admin/projects/{first_project}/runtime-config",

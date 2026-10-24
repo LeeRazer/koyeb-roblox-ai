@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 import hmac
+import math
 import re
 import secrets
 import time
@@ -74,6 +75,22 @@ project_candidate_weights = Table(
     Column("tactics", JSON, nullable=False),
     Column("q_values", JSON, nullable=False),
     Column("total_battles", Integer, nullable=False, default=0),
+    Column("last_updated", Float, nullable=False),
+)
+
+
+project_action_statistics = Table(
+    "platform_action_statistics",
+    metadata,
+    Column("project_id", String(36), primary_key=True),
+    Column("enemy_type", String(64), primary_key=True),
+    Column("action_name", String(64), primary_key=True),
+    Column("sample_count", Integer, nullable=False, default=0),
+    Column("reward_mean", Float, nullable=False, default=0),
+    Column("reward_m2", Float, nullable=False, default=0),
+    Column("damage_sum", Float, nullable=False, default=0),
+    Column("success_count", Integer, nullable=False, default=0),
+    Column("dashed_count", Integer, nullable=False, default=0),
     Column("last_updated", Float, nullable=False),
 )
 
@@ -460,6 +477,67 @@ class PlatformStore:
         )
         connection.execute(statement)
 
+    def _update_action_statistics(
+        self,
+        connection: Connection,
+        project_id: str,
+        event: dict[str, Any],
+        action_name: str,
+        normalized_reward: float,
+        received_at: float,
+    ) -> None:
+        query = select(project_action_statistics).where(
+            project_action_statistics.c.project_id == project_id,
+            project_action_statistics.c.enemy_type == event["enemy_type"],
+            project_action_statistics.c.action_name == action_name,
+        )
+        if self.is_postgresql:
+            query = query.with_for_update()
+        row = connection.execute(query).mappings().first()
+        damage = float(event.get("player_health_lost", 0))
+        success = 1 if normalized_reward > 0 else 0
+        dashed = 1 if event.get("player_dashed") else 0
+        if row is None:
+            connection.execute(
+                insert(project_action_statistics).values(
+                    project_id=project_id,
+                    enemy_type=event["enemy_type"],
+                    action_name=action_name,
+                    sample_count=1,
+                    reward_mean=normalized_reward,
+                    reward_m2=0,
+                    damage_sum=damage,
+                    success_count=success,
+                    dashed_count=dashed,
+                    last_updated=received_at,
+                )
+            )
+            return
+
+        old_count = int(row["sample_count"])
+        new_count = old_count + 1
+        old_mean = float(row["reward_mean"])
+        delta = normalized_reward - old_mean
+        new_mean = old_mean + delta / new_count
+        new_m2 = float(row["reward_m2"]) + delta * (normalized_reward - new_mean)
+        connection.execute(
+            update(project_action_statistics)
+            .where(
+                project_action_statistics.c.project_id == project_id,
+                project_action_statistics.c.enemy_type == event["enemy_type"],
+                project_action_statistics.c.action_name == action_name,
+            )
+            .values(
+                sample_count=new_count,
+                reward_mean=new_mean,
+                reward_m2=max(0, new_m2),
+                damage_sum=float(row["damage_sum"]) + damage,
+                success_count=int(row["success_count"]) + success,
+                dashed_count=int(row["dashed_count"]) + dashed,
+                last_updated=received_at,
+            )
+        )
+
     def process_batch(self, project_id: str, batch: dict[str, Any]) -> dict[str, int]:
         accepted = 0
         duplicates = 0
@@ -507,6 +585,14 @@ class PlatformStore:
                     continue
 
                 self._aggregate(
+                    connection,
+                    project_id,
+                    event,
+                    action_name,
+                    normalized_reward,
+                    received_at,
+                )
+                self._update_action_statistics(
                     connection,
                     project_id,
                     event,
@@ -574,11 +660,78 @@ class PlatformStore:
                 "zombies": zombies,
             }
 
+    def _evaluate_with_connection(
+        self,
+        connection: Connection,
+        project_id: str,
+        minimum_samples_per_action: int,
+    ) -> dict[str, Any]:
+        rows = connection.execute(
+            select(project_action_statistics)
+            .where(project_action_statistics.c.project_id == project_id)
+            .order_by(
+                project_action_statistics.c.enemy_type,
+                project_action_statistics.c.action_name,
+            )
+        ).mappings().all()
+        actions: list[dict[str, Any]] = []
+        total_samples = 0
+        weighted_reward_sum = 0.0
+        eligible_actions = 0
+        for row in rows:
+            count = int(row["sample_count"])
+            mean = float(row["reward_mean"])
+            variance = float(row["reward_m2"]) / (count - 1) if count > 1 else 0.0
+            standard_error = math.sqrt(max(0.0, variance) / count) if count else 0.0
+            lower_confidence_bound = mean - 1.96 * standard_error
+            eligible = count >= minimum_samples_per_action
+            if eligible:
+                eligible_actions += 1
+            total_samples += count
+            weighted_reward_sum += mean * count
+            actions.append(
+                {
+                    "enemy_type": row["enemy_type"],
+                    "action_name": row["action_name"],
+                    "sample_count": count,
+                    "reward_mean": round(mean, 6),
+                    "reward_variance": round(variance, 6),
+                    "standard_error": round(standard_error, 6),
+                    "lower_95_bound": round(lower_confidence_bound, 6),
+                    "success_rate": round(int(row["success_count"]) / count, 6),
+                    "dash_rate": round(int(row["dashed_count"]) / count, 6),
+                    "damage_mean": round(float(row["damage_sum"]) / count, 6),
+                    "eligible": eligible,
+                }
+            )
+        return {
+            "project_id": project_id,
+            "minimum_samples_per_action": minimum_samples_per_action,
+            "total_samples": total_samples,
+            "evaluated_actions": len(actions),
+            "eligible_actions": eligible_actions,
+            "overall_reward_mean": round(
+                weighted_reward_sum / total_samples if total_samples else 0.0,
+                6,
+            ),
+            "actions": actions,
+        }
+
+    def evaluate(self, project_id: str, minimum_samples_per_action: int = 20) -> dict[str, Any]:
+        with self.engine.connect() as connection:
+            return self._evaluate_with_connection(
+                connection,
+                project_id,
+                minimum_samples_per_action,
+            )
+
     def promote(
         self,
         project_id: str,
         note: str,
         minimum_total_events: int,
+        minimum_samples_per_action: int,
+        minimum_eligible_actions: int,
         force: bool,
     ) -> dict[str, Any]:
         with self.legacy_store.transaction() as connection:
@@ -593,6 +746,17 @@ class PlatformStore:
             if total_events < minimum_total_events and not force:
                 raise ValueError(
                     f"Se requieren {minimum_total_events} eventos; existen {total_events}"
+                )
+            evaluation = self._evaluate_with_connection(
+                connection,
+                project_id,
+                minimum_samples_per_action,
+            )
+            if evaluation["eligible_actions"] < minimum_eligible_actions and not force:
+                raise ValueError(
+                    "Evidencia insuficiente: "
+                    f"{evaluation['eligible_actions']} acciones elegibles de "
+                    f"{minimum_eligible_actions} requeridas"
                 )
             version = f"1-r{state['candidate_revision']}"
             now = time.time()

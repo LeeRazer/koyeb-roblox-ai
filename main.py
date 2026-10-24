@@ -13,6 +13,7 @@ from app.schemas import (
     CombatEventBatch,
     DirectorModifiers,
     PromoteRequest,
+    PlatformPromoteRequest,
     ProjectCreate,
     ProjectKeyCreate,
     RollbackRequest,
@@ -283,7 +284,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/v3/admin/projects/{project_id}/promote")
     def promote_platform_candidate(
         project_id: str,
-        payload: PromoteRequest,
+        payload: PlatformPromoteRequest,
         _access: None = Depends(admin_guard),
     ) -> dict[str, Any]:
         try:
@@ -293,6 +294,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             }
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    @app.get("/api/v3/admin/projects/{project_id}/evaluation")
+    def evaluate_platform_candidate(
+        project_id: str,
+        minimum_samples_per_action: int = 20,
+        _access: None = Depends(admin_guard),
+    ) -> dict[str, Any]:
+        if minimum_samples_per_action < 1 or minimum_samples_per_action > 1_000_000:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="minimum_samples_per_action fuera de rango",
+            )
+        return platform.evaluate(project_id, minimum_samples_per_action)
 
     @app.post("/api/v3/admin/projects/{project_id}/rollback")
     def rollback_platform_candidate(

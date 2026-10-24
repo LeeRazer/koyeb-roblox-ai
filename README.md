@@ -50,7 +50,9 @@ Roblox gradualmente. El antiguo backup SQLite publico responde `410 Gone`.
 
 La vista previa multi-juego vive en `/api/v3`. Cada proyecto tiene claves
 revocables, Universe/Place allowlists, candidato, versiones, almacenamiento y
-configuracion completamente aislados. Consulta [docs/V3_API.md](docs/V3_API.md).
+configuracion completamente aislados. Su evaluador calcula evidencia y limites
+de confianza por accion; una promocion insuficiente responde `409` y no cambia
+produccion. Consulta [docs/V3_API.md](docs/V3_API.md).
 
 Cada evento v2 necesita un UUID estable en `event_id`. Si Roblox reintenta el
 mismo lote, el servidor lo reconoce como duplicado y no vuelve a entrenar.

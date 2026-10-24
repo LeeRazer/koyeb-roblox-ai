@@ -85,6 +85,11 @@ class PromoteRequest(StrictModel):
     force: bool = False
 
 
+class PlatformPromoteRequest(PromoteRequest):
+    minimum_samples_per_action: int = Field(default=20, ge=1, le=1_000_000_000)
+    minimum_eligible_actions: int = Field(default=1, ge=1, le=10_000)
+
+
 class RollbackRequest(StrictModel):
     version: str = Field(min_length=1, max_length=64)
     note: str = Field(default="manual rollback", min_length=1, max_length=250)
