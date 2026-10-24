@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+import time
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
+from sqlalchemy import update
 
 from app.config import Settings
+from app.store import battle_events
 from main import create_app
 
 
@@ -160,3 +163,32 @@ def test_unknown_action_is_rejected(tmp_path: Path) -> None:
     with make_client(tmp_path) as client:
         response = client.post("/api/v2/events/batch", json=payload, headers=auth())
         assert response.status_code == 422
+
+
+def test_raw_retention_preserves_aggregates_and_learning(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        for _ in range(2):
+            response = client.post(
+                "/api/v2/events/batch",
+                json=event_batch(str(uuid4())),
+                headers=auth(),
+            )
+            assert response.status_code == 200
+
+        before = client.get("/api/v2/admin/storage", headers=auth()).json()
+        assert before["raw_event_count"] == 2
+        assert before["aggregated_event_count"] == 2
+        assert before["daily_aggregate_rows"] == 1
+
+        store = client.app.state.store
+        with store.transaction() as connection:
+            connection.execute(
+                update(battle_events).values(received_at=time.time() - 4 * 24 * 3_600)
+            )
+        assert store.prune_raw_events() == 2
+
+        after = client.get("/api/v2/admin/storage", headers=auth()).json()
+        candidate = client.get("/api/v2/admin/candidate", headers=auth()).json()
+        assert after["raw_event_count"] == 0
+        assert after["aggregated_event_count"] == 2
+        assert candidate["zombies"]["ZombittCarcelero"]["total_battles"] == 2

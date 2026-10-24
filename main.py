@@ -173,6 +173,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def export_state(_access: None = Depends(guard)) -> dict[str, Any]:
         return store.export_state()
 
+    @app.get("/api/v2/admin/storage")
+    def storage_status(_access: None = Depends(guard)) -> dict[str, Any]:
+        return store.get_storage_status()
+
     return app
 
 

@@ -42,6 +42,9 @@ class Settings:
     write_rate_limit_per_minute: int
     max_batch_size: int
     learning_rate: float
+    raw_event_retention_hours: int = 72
+    prune_interval_seconds: int = 3_600
+    max_archived_versions: int = 20
     service_version: str = "4.0.0"
     schema_version: int = 2
 
@@ -59,5 +62,8 @@ def load_settings() -> Settings:
         write_rate_limit_per_minute=_integer("WRITE_RATE_LIMIT_PER_MINUTE", 120, 10, 10_000),
         max_batch_size=_integer("MAX_BATCH_SIZE", 100, 1, 500),
         learning_rate=_float("LEARNING_RATE", 0.12, 0.01, 0.50),
+        raw_event_retention_hours=_integer("RAW_EVENT_RETENTION_HOURS", 72, 1, 24 * 365),
+        prune_interval_seconds=_integer("PRUNE_INTERVAL_SECONDS", 3_600, 60, 86_400),
+        max_archived_versions=_integer("MAX_ARCHIVED_VERSIONS", 20, 2, 1_000),
     )
 
