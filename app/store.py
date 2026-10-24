@@ -195,7 +195,7 @@ class AIStore:
 
             self._migrate_legacy_if_present(connection)
 
-            state_created = self._insert_ignore(
+            self._insert_ignore(
                 connection,
                 runtime_state,
                 {
@@ -207,16 +207,32 @@ class AIStore:
                 },
             )
 
-            if state_created:
-                initial_version = f"{self.settings.service_version}-r0"
+            # Do not rely on INSERT .. ON CONFLICT rowcount to decide whether
+            # the active model exists. Some PostgreSQL drivers can report an
+            # ambiguous rowcount, leaving runtime_state pointing at a missing
+            # snapshot after an otherwise successful first startup.
+            state = connection.execute(
+                select(runtime_state).where(runtime_state.c.id == 1)
+            ).mappings().one()
+            active_version = str(state["active_version"])
+            version_exists = connection.execute(
+                select(model_versions.c.version).where(
+                    model_versions.c.version == active_version
+                )
+            ).scalar_one_or_none()
+            if version_exists is None:
+                LOGGER.warning(
+                    "Active model %s was missing; rebuilding its snapshot from candidate state",
+                    active_version,
+                )
                 self._insert_ignore(
                     connection,
                     model_versions,
                     {
-                        "version": initial_version,
+                        "version": active_version,
                         "status": "production",
                         "snapshot": {"zombies": self._candidate_snapshot(connection)},
-                        "note": "initial validated defaults",
+                        "note": "recovered missing active snapshot",
                         "created_at": now,
                         "promoted_at": now,
                     },

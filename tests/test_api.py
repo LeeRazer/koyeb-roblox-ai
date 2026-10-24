@@ -5,10 +5,10 @@ import time
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 
 from app.config import Settings
-from app.store import battle_events
+from app.store import battle_events, model_versions
 from app.platform_store import project_api_keys
 from main import create_app
 
@@ -72,6 +72,20 @@ def test_snapshot_is_stable_and_v1_compatible(tmp_path: Path) -> None:
         assert first.json()["version"] == "4.0.0-r0"
         assert legacy.status_code == 200
         assert legacy.json()["zombies"] == first.json()["zombies"]
+
+
+def test_initialize_recovers_a_missing_active_snapshot(tmp_path: Path) -> None:
+    with make_client(tmp_path) as client:
+        store = client.app.state.store
+        with store.transaction() as connection:
+            connection.execute(delete(model_versions))
+
+        store.initialize()
+
+        snapshot = client.get("/api/v2/snapshot")
+        assert snapshot.status_code == 200
+        assert snapshot.json()["version"] == "4.0.0-r0"
+        assert len(snapshot.json()["zombies"]) == 10
 
 
 def test_writes_require_key_and_can_be_disabled(tmp_path: Path) -> None:
