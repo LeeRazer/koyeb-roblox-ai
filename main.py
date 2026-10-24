@@ -1,193 +1,179 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
-from typing import Dict, List, Any, Optional
-import sqlite3
-import time
-import json
-import os
+from __future__ import annotations
 
-app = FastAPI(title="Roblox Zombie AI Q-Learning Brain", version="3.0.0")
+from contextlib import asynccontextmanager
+import logging
+from typing import Any
+from uuid import uuid4
 
-DB_PATH = "zombie_ai_brain.db"
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 
-# 1. Initialize SQLite Database for Permanent Multi-Game Persistence
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS zombie_weights (
-            enemy_type TEXT PRIMARY KEY,
-            tactics_json TEXT,
-            q_values_json TEXT,
-            total_battles INTEGER DEFAULT 0,
-            last_updated REAL
+from app.config import Settings, load_settings
+from app.schemas import (
+    BattleActionResultV1,
+    CombatEventBatch,
+    DirectorModifiers,
+    PromoteRequest,
+    RollbackRequest,
+    SnapshotResponse,
+)
+from app.security import WriteGuard
+from app.store import AIStore
+
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+LOGGER = logging.getLogger("roblox-ai")
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    configured = settings or load_settings()
+    store = AIStore(configured)
+    guard = WriteGuard(configured)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        store.initialize()
+        LOGGER.info(
+            "Roblox AI service %s ready (database=%s, writes=%s)",
+            configured.service_version,
+            store.engine.dialect.name,
+            "enabled" if configured.api_key else "disabled",
         )
-    """)
-    conn.commit()
+        if not configured.persistent_database:
+            LOGGER.warning(
+                "SQLite activo: en Koyeb los datos se pierden al recrear la instancia "
+                "salvo que SQLITE_PATH apunte a un volumen persistente"
+            )
+        try:
+            yield
+        finally:
+            store.engine.dispose()
 
-    # Initial default Q-values & tactics for the 10 Zombie Types
-    default_zombies = {
-        "Zombitt": {
-            "tactics": {"approach_lateral": 0.62, "orbit_bias": 0.20, "aggression": 0.5},
-            "q_values": {"zigzag_step": 10.0, "straight_charge": 5.0}
-        },
-        "GiggleBiT": {
-            "tactics": {"intercept_prediction": 0.85, "reference_speed": 22.0, "never_retreat": True},
-            "q_values": {"vector_intercept": 15.0, "flank_ambush": 12.0}
-        },
-        "Zombie Police": {
-            "tactics": {"shield_block_chance": 0.45, "orbit_bias": 0.18, "push_freq": 0.4},
-            "q_values": {"align_shield": 12.0, "shield_bash": 8.0}
-        },
-        "ZombittCarcelero": {
-            "tactics": {"chain_grab_stamina_wait": 0.3, "tactical_range": 32.0},
-            "q_values": {"stamina_drain_grab": 14.0, "instant_grab": 6.0}
-        },
-        "Infectus": {
-            "tactics": {"preferred_min": 6.0, "preferred_max": 11.0, "retreat_lateral": 0.65},
-            "q_values": {"spit_kiting": 11.0, "close_range_spit": 4.0}
-        },
-        "Gross": {
-            "tactics": {"reference_speed": 8.0, "aoe_slam_dist": 14.0},
-            "q_values": {"heavy_slam": 10.0, "body_block": 7.0}
-        },
-        "ZombittRecolector": {
-            "tactics": {"preferred_min": 3.8, "approach_lateral": 0.62},
-            "q_values": {"scavenge_flank": 8.0, "direct_melee": 5.0}
-        },
-        "ZombittResonante": {
-            "tactics": {"preferred_min": 20.0, "tactical_range": 45.0},
-            "q_values": {"long_range_wave": 12.0, "reposition": 9.0}
-        },
-        "ZombittCarmesi": {
-            "tactics": {"preferred_min": 17.0, "tactical_range": 38.0},
-            "q_values": {"crimson_burst": 11.0, "strafe_shoot": 8.0}
-        },
-        "JoRvboT": {
-            "tactics": {"tactical_range": 48.0, "preferred_min": 20.0},
-            "q_values": {"snipe_beam": 13.0, "tactical_retreat": 10.0}
+    app = FastAPI(
+        title="Roblox Zombie AI Learning Service",
+        version=configured.service_version,
+        lifespan=lifespan,
+    )
+    app.state.settings = configured
+    app.state.store = store
+
+    @app.get("/")
+    def root() -> dict[str, Any]:
+        return {
+            "status": "online",
+            "version": configured.service_version,
+            "schema_version": configured.schema_version,
+            "writes_enabled": configured.api_key is not None,
+            "persistent_database": configured.persistent_database,
         }
-    }
 
-    for enemy_name, data in default_zombies.items():
-        cursor.execute("SELECT enemy_type FROM zombie_weights WHERE enemy_type = ?", (enemy_name,))
-        if not cursor.fetchone():
-            cursor.execute("""
-                INSERT INTO zombie_weights (enemy_type, tactics_json, q_values_json, total_battles, last_updated)
-                VALUES (?, ?, ?, ?, ?)
-            """, (
-                enemy_name,
-                json.dumps(data["tactics"]),
-                json.dumps(data["q_values"]),
-                0,
-                time.time()
-            ))
-    conn.commit()
-    conn.close()
+    @app.get("/health")
+    @app.get("/health/live")
+    def health_live() -> dict[str, str]:
+        return {"status": "ok", "version": configured.service_version}
 
-@app.on_event("startup")
-def startup_event():
-    init_db()
-    print("\n==================================================")
-    print("🚀 PRENDIÓ LA VERSIÓN 3.0.0 - Q-LEARNING ZOMBIE AI ACTIVE")
-    print("==================================================\n")
+    @app.get("/health/ready")
+    def health_ready() -> dict[str, str]:
+        if not store.ready():
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="database unavailable",
+            )
+        return {"status": "ready", "database": store.engine.dialect.name}
 
-# Models
-class BattleActionResult(BaseModel):
-    enemy_type: str
-    action_name: str         # e.g., "zigzag_step", "stamina_drain_grab", "vector_intercept"
-    reward: float            # Positive reward (e.g. +10 for hit/damage) or Negative penalty (-5 for quick death)
-    player_dashed: bool = False
-    player_health_lost: float = 0.0
+    @app.get("/api/v2/snapshot", response_model=SnapshotResponse)
+    def get_snapshot_v2() -> dict[str, Any]:
+        return store.get_snapshot()
 
-@app.get("/")
-def root():
-    return {
-        "status": "online",
-        "message": "PRENDIÓ LA VERSIÓN 3.0.0 - Q-LEARNING ZOMBIE AI ACTIVE",
-        "version": "3.0.0",
-        "db": "SQLite persistent"
-    }
+    @app.post("/api/v2/events/batch")
+    def report_batch(
+        batch: CombatEventBatch,
+        _access: None = Depends(guard),
+    ) -> dict[str, int | str]:
+        if len(batch.events) > configured.max_batch_size:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"El maximo configurado es {configured.max_batch_size} eventos",
+            )
+        result = store.process_batch(batch.model_dump(mode="json"))
+        return {"status": "accepted", **result}
 
-@app.get("/health")
-def health():
-    return {"status": "ok", "version": "3.0.0"}
-
-@app.get("/api/v1/zombie-brain-weights")
-def get_zombie_brain_weights():
-    """Returns the trained weights & tactics for all 10 Zombie types"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT enemy_type, tactics_json, q_values_json, total_battles FROM zombie_weights")
-    rows = cursor.fetchall()
-    conn.close()
-
-    result = {}
-    for row in rows:
-        enemy_type, tactics_json, q_values_json, battles = row
-        result[enemy_type] = {
-            "tactics": json.loads(tactics_json),
-            "q_values": json.loads(q_values_json),
-            "total_battles": battles
+    # These routes keep deployed Roblox servers working during the v2 migration.
+    @app.get("/api/v1/zombie-brain-weights")
+    def get_snapshot_v1() -> dict[str, Any]:
+        snapshot = store.get_snapshot()
+        return {
+            "version": snapshot["version"],
+            "timestamp": snapshot["timestamp"],
+            "message": "validated production snapshot",
+            "director_modifiers": snapshot["director_modifiers"],
+            "zombies": snapshot["zombies"],
         }
-    return {
-        "version": "3.0.0",
-        "timestamp": int(time.time()),
-        "message": "PRENDIÓ LA VERSIÓN 3.0.0",
-        "zombies": result
-    }
 
-@app.post("/api/v1/report-zombie-action")
-def report_zombie_action(action: BattleActionResult):
-    """Q-Learning update endpoint called asynchronously from Roblox"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT tactics_json, q_values_json, total_battles FROM zombie_weights WHERE enemy_type = ?", (action.enemy_type,))
-    row = cursor.fetchone()
-    
-    if not row:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Enemy type not registered")
-        
-    tactics = json.loads(row[0])
-    q_values = json.loads(row[1])
-    battles = row[2] + 1
-    
-    # Q-Learning Bellman Update Rule: Q(s,a) = Q(s,a) + alpha * (reward - Q(s,a))
-    alpha = 0.15 # Learning rate
-    current_q = q_values.get(action.action_name, 5.0)
-    new_q = current_q + alpha * (action.reward - current_q)
-    q_values[action.action_name] = round(new_q, 3)
+    @app.post("/api/v1/report-zombie-action")
+    def report_action_v1(
+        action: BattleActionResultV1,
+        request: Request,
+        _access: None = Depends(guard),
+    ) -> dict[str, int | str]:
+        batch = {
+            "client_version": request.headers.get("X-AI-Client-Schema", "v1-compat"),
+            "universe_id": request.headers.get("X-Roblox-Universe-Id", "unknown"),
+            "place_id": request.headers.get("X-Roblox-Place-Id", "unknown"),
+            "job_id": request.headers.get("X-Roblox-Job-Id", "v1-compat"),
+            "events": [{"event_id": str(uuid4()), **action.model_dump(mode="json")}],
+        }
+        result = store.process_batch(batch)
+        return {"status": "accepted", "server_version": configured.service_version, **result}
 
-    # Dynamic adaptation of physical tactics based on learned Q-values:
-    if action.enemy_type == "Zombitt":
-        if q_values.get("zigzag_step", 0) > q_values.get("straight_charge", 0):
-            tactics["approach_lateral"] = min(0.88, tactics.get("approach_lateral", 0.62) + 0.01)
-    elif action.enemy_type == "ZombittCarcelero":
-        if action.player_dashed and action.reward > 0:
-            tactics["chain_grab_stamina_wait"] = min(0.90, tactics.get("chain_grab_stamina_wait", 0.3) + 0.02)
-    elif action.enemy_type == "Zombie Police":
-        if action.reward > 0:
-            tactics["shield_block_chance"] = min(0.85, tactics.get("shield_block_chance", 0.45) + 0.01)
-    elif action.enemy_type == "GiggleBiT":
-        if action.reward > 0:
-            tactics["intercept_prediction"] = min(0.95, tactics.get("intercept_prediction", 0.85) + 0.01)
+    @app.get("/api/v1/backup-db")
+    def retired_public_backup() -> None:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="El backup publico fue retirado; usa el export autenticado",
+        )
 
-    cursor.execute("""
-        UPDATE zombie_weights 
-        SET tactics_json = ?, q_values_json = ?, total_battles = ?, last_updated = ?
-        WHERE enemy_type = ?
-    """, (json.dumps(tactics), json.dumps(q_values), battles, time.time(), action.enemy_type))
-    
-    conn.commit()
-    conn.close()
-    
-    return {"status": "success", "updated_q": new_q, "server_version": "3.0.0"}
+    @app.get("/api/v2/admin/candidate")
+    def get_candidate(_access: None = Depends(guard)) -> dict[str, Any]:
+        return store.get_candidate()
 
-@app.get("/api/v1/backup-db")
-def backup_db():
-    """Allows downloading the SQLite database file directly to PC"""
-    if os.path.exists(DB_PATH):
-        return FileResponse(DB_PATH, filename="zombie_ai_brain.db", media_type="application/x-sqlite3")
-    raise HTTPException(status_code=404, detail="Database file not found")
+    @app.post("/api/v2/admin/promote")
+    def promote(
+        request: PromoteRequest,
+        _access: None = Depends(guard),
+    ) -> dict[str, Any]:
+        try:
+            return {"status": "promoted", **store.promote(**request.model_dump())}
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    @app.post("/api/v2/admin/rollback")
+    def rollback(
+        request: RollbackRequest,
+        _access: None = Depends(guard),
+    ) -> dict[str, str]:
+        try:
+            return store.rollback(request.version, request.note)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Version no encontrada",
+            ) from exc
+
+    @app.put("/api/v2/admin/runtime-config")
+    def runtime_config(
+        modifiers: DirectorModifiers,
+        _access: None = Depends(guard),
+    ) -> dict[str, Any]:
+        return {
+            "status": "updated",
+            "director_modifiers": store.update_modifiers(modifiers.model_dump()),
+        }
+
+    @app.get("/api/v2/admin/export")
+    def export_state(_access: None = Depends(guard)) -> dict[str, Any]:
+        return store.export_state()
+
+    return app
+
+
+app = create_app()
