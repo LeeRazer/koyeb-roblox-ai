@@ -437,9 +437,12 @@ class AIStore:
                         "job_id": batch["job_id"],
                         "client_version": batch["client_version"],
                         "context": {
+                            "encounter_id": event_data.get("encounter_id"),
+                            "sequence_number": event_data.get("sequence_number"),
                             "occurred_at": event_data.get("occurred_at"),
                             "difficulty": event_data.get("difficulty"),
                             "room_number": event_data.get("room_number"),
+                            "decision_context": event_data.get("decision_context"),
                         },
                         "received_at": received_at,
                     },

@@ -20,6 +20,7 @@ Variables obligatorias en produccion:
 |---|---|
 | `DATABASE_URL` | PostgreSQL persistente. Koyeb recrea el disco local de una instancia. |
 | `AI_API_KEY` | Secreto compartido para escrituras y rutas administrativas. |
+| `ADMIN_API_KEY` | Secreto administrativo separado para la plataforma v3. |
 
 Opcionales: `WRITE_RATE_LIMIT_PER_MINUTE` (120), `MAX_BATCH_SIZE` (100) y
 `LEARNING_RATE` (0.12). Consulta [.env.example](.env.example).
@@ -46,6 +47,10 @@ escribible; sin un volumen montado en `/data`, ese archivo sigue siendo efimero.
 
 Las rutas v1 de lectura y reporte siguen disponibles para migrar servidores de
 Roblox gradualmente. El antiguo backup SQLite publico responde `410 Gone`.
+
+La vista previa multi-juego vive en `/api/v3`. Cada proyecto tiene claves
+revocables, Universe/Place allowlists, candidato, versiones, almacenamiento y
+configuracion completamente aislados. Consulta [docs/V3_API.md](docs/V3_API.md).
 
 Cada evento v2 necesita un UUID estable en `event_id`. Si Roblox reintenta el
 mismo lote, el servidor lo reconoce como duplicado y no vuelve a entrenar.

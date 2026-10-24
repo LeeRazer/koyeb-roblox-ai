@@ -15,7 +15,12 @@ from main import create_app
 API_KEY = "test-key-that-is-not-used-in-production"
 
 
-def make_client(tmp_path: Path, *, api_key: str | None = API_KEY) -> TestClient:
+def make_client(
+    tmp_path: Path,
+    *,
+    api_key: str | None = API_KEY,
+    admin_api_key: str | None = None,
+) -> TestClient:
     tmp_path.mkdir(parents=True, exist_ok=True)
     database = (tmp_path / "test.db").as_posix()
     settings = Settings(
@@ -25,6 +30,7 @@ def make_client(tmp_path: Path, *, api_key: str | None = API_KEY) -> TestClient:
         write_rate_limit_per_minute=1_000,
         max_batch_size=100,
         learning_rate=0.12,
+        admin_api_key=admin_api_key,
     )
     return TestClient(create_app(settings))
 
@@ -192,3 +198,130 @@ def test_raw_retention_preserves_aggregates_and_learning(tmp_path: Path) -> None
         assert after["raw_event_count"] == 0
         assert after["aggregated_event_count"] == 2
         assert candidate["zombies"]["ZombittCarcelero"]["total_battles"] == 2
+
+
+def test_v3_projects_are_isolated_and_keys_can_be_revoked(tmp_path: Path) -> None:
+    admin_key = "separate-platform-admin-key"
+    admin_headers = {"X-Admin-Key": admin_key}
+    with make_client(tmp_path, admin_api_key=admin_key) as client:
+        assert client.get("/api/v3/admin/projects", headers=auth()).status_code == 401
+
+        first = client.post(
+            "/api/v3/admin/projects",
+            json={
+                "name": "First Game",
+                "slug": "first-game",
+                "universe_id": "1001",
+                "place_ids": ["2001"],
+            },
+            headers=admin_headers,
+        )
+        second = client.post(
+            "/api/v3/admin/projects",
+            json={
+                "name": "Second Game",
+                "slug": "second-game",
+                "universe_id": "1002",
+                "place_ids": ["2002"],
+            },
+            headers=admin_headers,
+        )
+        assert first.status_code == 200
+        assert second.status_code == 200
+
+        first_data = first.json()
+        second_data = second.json()
+        first_key = first_data["key"]["api_key"]
+        second_key = second_data["key"]["api_key"]
+        first_project = first_data["project"]["project_id"]
+        second_project = second_data["project"]["project_id"]
+
+        first_game_headers = {
+            "X-API-Key": first_key,
+            "X-Roblox-Universe-Id": "1001",
+            "X-Roblox-Place-Id": "2001",
+        }
+        assert client.get("/api/v3/snapshot", headers=first_game_headers).status_code == 200
+        assert client.get(
+            "/api/v3/snapshot",
+            headers={
+                "X-API-Key": first_key,
+                "X-Roblox-Universe-Id": "1001",
+                "X-Roblox-Place-Id": "9999",
+            },
+        ).status_code == 403
+
+        payload = event_batch(str(uuid4()))
+        payload["universe_id"] = "1001"
+        payload["place_id"] = "2001"
+        learned = client.post(
+            "/api/v3/events/batch",
+            json=payload,
+            headers={"X-API-Key": first_key},
+        )
+        assert learned.status_code == 200
+        assert learned.json()["accepted"] == 1
+
+        first_candidate = client.get(
+            f"/api/v3/admin/projects/{first_project}/candidate",
+            headers=admin_headers,
+        ).json()
+        second_candidate = client.get(
+            f"/api/v3/admin/projects/{second_project}/candidate",
+            headers=admin_headers,
+        ).json()
+        assert first_candidate["total_events"] == 1
+        assert second_candidate["total_events"] == 0
+
+        promoted = client.post(
+            f"/api/v3/admin/projects/{first_project}/promote",
+            json={"note": "isolated test", "minimum_total_events": 1},
+            headers=admin_headers,
+        )
+        assert promoted.status_code == 200
+        assert promoted.json()["version"] == "1-r1"
+        assert client.get("/api/v3/snapshot", headers=first_game_headers).json()[
+            "version"
+        ] == "1-r1"
+
+        configured = client.put(
+            f"/api/v3/admin/projects/{first_project}/runtime-config",
+            json={
+                "horde_multiplier": 1.1,
+                "special_cap_bonus": 1,
+                "stress_accumulation_rate": 1.0,
+                "interval_speed": 0.9,
+            },
+            headers=admin_headers,
+        )
+        assert configured.status_code == 200
+        assert client.get("/api/v3/snapshot", headers=first_game_headers).json()[
+            "director_modifiers"
+        ]["horde_multiplier"] == 1.1
+
+        rolled_back = client.post(
+            f"/api/v3/admin/projects/{first_project}/rollback",
+            json={"version": "1-r0", "note": "isolation rollback"},
+            headers=admin_headers,
+        )
+        assert rolled_back.status_code == 200
+        assert client.get("/api/v3/snapshot", headers=first_game_headers).json()[
+            "version"
+        ] == "1-r0"
+
+        wrong_tenant_payload = event_batch(str(uuid4()))
+        wrong_tenant_payload["universe_id"] = "1001"
+        wrong_tenant_payload["place_id"] = "2001"
+        assert client.post(
+            "/api/v3/events/batch",
+            json=wrong_tenant_payload,
+            headers={"X-API-Key": second_key},
+        ).status_code == 403
+
+        key_id = first_data["key"]["key_id"]
+        revoked = client.delete(
+            f"/api/v3/admin/projects/{first_project}/keys/{key_id}",
+            headers=admin_headers,
+        )
+        assert revoked.status_code == 200
+        assert client.get("/api/v3/snapshot", headers=first_game_headers).status_code == 401
